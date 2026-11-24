@@ -1064,6 +1064,7 @@ class HandsFreeVAD(threading.Thread):
         super().__init__(daemon=True)
         self.commander = commander
         self.stop_event = stop_event
+        self.cooldown_until: float = 0.0
         # Track when THIS thread just called superwhisper stop so we never re-attach to a finishing .capture/*.wav file!
         self.last_stop_at: float = 0.0
 
