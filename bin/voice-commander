@@ -126,7 +126,7 @@ def load_config() -> dict[str, Any]:
             "audio_device": "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo",
         },
         "vad": {
-            "enabled": True,
+            "enabled": False,
             "sample_rate": 16000,
             "energy_threshold": 2100,
             "start_multiplier": 2.4,

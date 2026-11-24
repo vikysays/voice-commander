@@ -23,8 +23,8 @@ live_osd = true
 audio_device = "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo"
 
 [vad]
-# Enable hands-free voice activity detection on startup
-enabled = true
+# Disable continuous auto-hearing VAD by default; use Ctrl+Alt+Space hotkey to start/stop recording!
+enabled = false
 # Sample rate in Hz
 sample_rate = 16000
 # Minimum RMS threshold to trigger speech start (calibrated for 75% GoMic gain: normal speech is 2200-8000, ambient room floor is ~550-900)
