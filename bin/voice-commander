@@ -659,6 +659,63 @@ class VoiceCommander:
                 self.alert("Typed Line", f"{payload} [Enter]")
             return {"status": "command", "action": "type_line", "text": payload}
 
+        # --- E. WINDOW & WORKSPACE MANAGEMENT (Hyprland Lua IPC) ---
+        if norm in ("close window", "kill window", "quit window", "close application", "close app", "exit window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "hl.dsp.window.close()"], shell=False)
+                self.alert("Window Control", "Closed active window")
+            return {"status": "command", "action": "close_window"}
+
+        if norm in ("fullscreen", "full screen", "toggle fullscreen", "maximize", "maximize window", "expand window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'], shell=False)
+                self.alert("Window Control", "Toggled fullscreen")
+            return {"status": "command", "action": "fullscreen"}
+
+        if norm in ("toggle floating", "float window", "floating window", "tile window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", 'hl.dsp.window.float({ action = "toggle" })'], shell=False)
+                self.alert("Window Control", "Toggled floating window")
+            return {"status": "command", "action": "toggle_floating"}
+
+        if norm in ("next workspace", "workspace next", "switch workspace"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", 'hl.dsp.focus({ workspace = "m+1" })'], shell=False)
+                self.alert("Workspace", "Switched to next workspace")
+            return {"status": "command", "action": "next_workspace"}
+
+        if norm in ("previous workspace", "workspace previous", "last workspace", "back workspace"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", 'hl.dsp.focus({ workspace = "m-1" })'], shell=False)
+                self.alert("Workspace", "Switched to previous workspace")
+            return {"status": "command", "action": "prev_workspace"}
+
+        m = re.match(r"^(?:(?:take\s+me\s+to|go\s+to|switch\s+to|focus|open|move\s+to)\s+)?workspace\s+(?:number\s+)?(\w+)$", norm)
+        if m:
+            num = extract_number(m.group(1))
+            if num is not None:
+                if not dry_check:
+                    run_bg(["hyprctl", "dispatch", f"o.workspaces.focus({num})"], shell=False)
+                    self.alert("Workspace", f"Switched to Workspace {num}")
+                return {"status": "command", "action": "workspace", "number": num}
+
+        m = re.match(r"^move\s+(?:window\s+|this\s+)?to\s+workspace\s+(?:number\s+)?(\w+)$", norm)
+        if m:
+            num = extract_number(m.group(1))
+            if num is not None:
+                if not dry_check:
+                    run_bg(["hyprctl", "dispatch", f"o.workspaces.move_window({num})"], shell=False)
+                    self.alert("Workspace", f"Moved window to Workspace {num}")
+                return {"status": "command", "action": "move_to_workspace", "number": num}
+
+        m = re.match(r"^(?:focus|window|move\s+focus)\s+(left|right|up|down)$", norm)
+        if m:
+            direction = m.group(1)[0]
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", f'hl.dsp.focus({{ direction = "{direction}" }})'], shell=False)
+                self.alert("Focus", f"Moved focus {m.group(1)}")
+            return {"status": "command", "action": "movefocus", "direction": m.group(1)}
+
         # --- B. AGENTIC BROWSER & PERSONAL ASSISTANT ACTIONS ---
         # 1. "click (on) <link text>" / "open link <link text>" / "follow link <link text>" / "select link <text>"
         m = re.match(
@@ -825,63 +882,6 @@ class VoiceCommander:
                 type_text(shell_cmd, press_enter=True)
                 self.alert("Terminal Command", f"Executed: {shell_cmd}")
             return {"status": "command", "action": "terminal_cmd", "cmd": shell_cmd}
-
-        # --- E. WINDOW & WORKSPACE MANAGEMENT (Hyprland) ---
-        if norm in ("close window", "kill window", "quit window", "close application", "close app", "exit window"):
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "killactive"])
-                self.alert("Window Control", "Closed active window")
-            return {"status": "command", "action": "close_window"}
-
-        if norm in ("fullscreen", "full screen", "toggle fullscreen", "maximize", "maximize window", "expand window"):
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "fullscreen", "0"])
-                self.alert("Window Control", "Toggled fullscreen")
-            return {"status": "command", "action": "fullscreen"}
-
-        if norm in ("toggle floating", "float window", "floating window", "tile window"):
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "togglefloating"])
-                self.alert("Window Control", "Toggled floating window")
-            return {"status": "command", "action": "toggle_floating"}
-
-        if norm in ("next workspace", "workspace next", "switch workspace"):
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "workspace", "m+1"])
-                self.alert("Workspace", "Switched to next workspace")
-            return {"status": "command", "action": "next_workspace"}
-
-        if norm in ("previous workspace", "workspace previous", "last workspace", "back workspace"):
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "workspace", "m-1"])
-                self.alert("Workspace", "Switched to previous workspace")
-            return {"status": "command", "action": "prev_workspace"}
-
-        m = re.match(r"^(?:(?:go\s+to|switch\s+to|focus|open)\s+)?workspace\s+(\w+)$", norm)
-        if m:
-            num = extract_number(m.group(1))
-            if num is not None:
-                if not dry_check:
-                    run_bg(["hyprctl", "dispatch", "workspace", str(num)])
-                    self.alert("Workspace", f"Switched to Workspace {num}")
-                return {"status": "command", "action": "workspace", "number": num}
-
-        m = re.match(r"^move\s+(?:window\s+)?to\s+workspace\s+(\w+)$", norm)
-        if m:
-            num = extract_number(m.group(1))
-            if num is not None:
-                if not dry_check:
-                    run_bg(["hyprctl", "dispatch", "movetoworkspace", str(num)])
-                    self.alert("Workspace", f"Moved window to Workspace {num}")
-                return {"status": "command", "action": "move_to_workspace", "number": num}
-
-        m = re.match(r"^(?:focus|window|move\s+focus)\s+(left|right|up|down)$", norm)
-        if m:
-            direction = m.group(1)[0]
-            if not dry_check:
-                run_bg(["hyprctl", "dispatch", "movefocus", direction])
-                self.alert("Focus", f"Moved focus {m.group(1)}")
-            return {"status": "command", "action": "movefocus", "direction": m.group(1)}
 
         # --- F. KEYBOARD & BROWSER SHORTCUTS ---
         # Notice: "enter", "escape", "tab", "backspace" now work directly as single-word commands too!
