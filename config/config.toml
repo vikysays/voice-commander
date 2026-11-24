@@ -5,14 +5,13 @@
 wake_words = ["computer", "jarvis", "omarchy", "command", "system", "assistant", "agent"]
 
 # Default operating mode on startup:
-# - "hybrid": (Recommended) Commands execute actions; dictation requires saying "Type <text>" or switching to "Dictation mode", so background noise NEVER types random sentences!
+# - "hybrid": (Recommended) Commands execute actions, and normal sentences/domains are typed directly into the focused window!
 # - "command": Only executes commands unless prefixed with "type" or "dictate".
 # - "dictation": Everything is typed unless prefixed with a wake word ("computer ...") or "command mode".
 default_mode = "hybrid"
 
-# In Hybrid Mode, require "type <text>" / "write <text>" (or switching to "dictation mode") before typing arbitrary sentences.
-# This prevents ambient conversation, background TV/phone audio, or Whisper hallucinations from typing random text into your windows!
-require_type_prefix_in_hybrid = true
+# Allow natural typing in Hybrid Mode without needing to say "Type ..." first
+require_type_prefix_in_hybrid = false
 
 # Show desktop notifications (OSD) for recognized commands and mode switches
 notifications = true

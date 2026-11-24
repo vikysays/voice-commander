@@ -526,7 +526,7 @@ class VoiceCommander:
                     else:
                         # Non-command segment inside a multi-segment utterance!
                         # Only type arbitrary non-command segments if in explicit "dictation" mode (or if require_type_prefix_in_hybrid is false)
-                        require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", True))
+                        require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", False))
                         seg_clean = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", seg.strip())
                         seg_lower = seg_clean.lower()
                         allow_free_typing = (self.mode == "dictation") or (self.mode == "hybrid" and not require_type_prefix)
@@ -571,7 +571,7 @@ class VoiceCommander:
 
             # IMPORTANT: If the user explicitly said "Computer, <something>" or is in Command Mode,
             # or if require_type_prefix_in_hybrid is enabled (default), NEVER paste unrecognized speech/noise as text!
-            require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", True))
+            require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", False))
             if has_wake_prefix or self.mode == "command" or (self.mode == "hybrid" and require_type_prefix):
                 if has_wake_prefix:
                     self.alert("Voice Command Unknown", f"Ignored unknown command: \"{target_raw}\"")
@@ -875,10 +875,10 @@ class VoiceCommander:
                     self.alert("Browser Tab", f"Switched to Tab {num}")
                 return {"status": "command", "action": "switch_tab", "tab": num}
 
-        # --- C. APP LAUNCHING ---
-        # Match "open your browser", "open my terminal", "launch the browser", or bare app names ("chromium", "browser", "terminal")
+        # --- C. APP LAUNCHING & BARE DOMAIN NAVIGATION ---
+        # Match "open your browser", "open my terminal", "launch the browser", or bare app/website/domain names ("chromium", "investment.com", "youtube")
         m = re.match(r"^(?:open|launch|start|run\s+app)\s+(?:the\s+|a\s+|an\s+|up\s+|your\s+|my\s+)?(.+)$", norm)
-        target = m.group(1).strip() if m else (norm if norm in apps else "")
+        target = m.group(1).strip() if m else norm
         if target:
             target = re.sub(r"^(?:the\s+|a\s+|an\s+|your\s+|my\s+)", "", target).strip()
             if target in apps:
@@ -894,10 +894,13 @@ class VoiceCommander:
                     self.alert("Opening Website", f"{target.title()} ({url})")
                 return {"status": "command", "action": "open_url", "site": target, "url": url}
             target_domain = target.replace(" dot ", ".")
-            if re.match(r"^[a-z0-9\-]+\.(?:com|org|net|io|dev|ai|edu)$", target_domain):
+            if re.match(r"^[a-z0-9\-]+\.(?:com|org|net|io|dev|ai|edu|co|in|gov|uk)$", target_domain):
                 url = f"https://{target_domain}"
                 if not dry_check:
-                    run_bg(["omarchy-launch-browser", url])
+                    if is_browser_focused():
+                        browser_navigate_to(target_domain)
+                    else:
+                        run_bg(["omarchy-launch-browser", url])
                     self.alert("Opening Website", url)
                 return {"status": "command", "action": "open_url", "url": url}
 
