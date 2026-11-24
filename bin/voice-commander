@@ -128,13 +128,13 @@ def load_config() -> dict[str, Any]:
         "vad": {
             "enabled": True,
             "sample_rate": 16000,
-            "energy_threshold": 2400,
-            "start_multiplier": 2.3,
+            "energy_threshold": 2100,
+            "start_multiplier": 2.4,
             "stop_multiplier": 1.55,
             "speech_start_chunks": 2,
             "silence_stop_seconds": 0.70,
             "max_record_seconds": 14.0,
-            "cooldown_seconds": 0.5,
+            "cooldown_seconds": 1.0,
         },
         "apps": {
             "terminal": "omarchy-launch-terminal",
@@ -1087,13 +1087,13 @@ class HandsFreeVAD(threading.Thread):
             live_osd = bool(cfg.get("general", {}).get("live_osd", True))
             vad_cfg = cfg.get("vad", {})
             sample_rate = int(vad_cfg.get("sample_rate", 16000))
-            base_threshold = float(vad_cfg.get("energy_threshold", 2400))
-            start_mult = float(vad_cfg.get("start_multiplier", 2.3))
+            base_threshold = float(vad_cfg.get("energy_threshold", 2100))
+            start_mult = float(vad_cfg.get("start_multiplier", 2.4))
             stop_mult = float(vad_cfg.get("stop_multiplier", 1.55))
             start_chunks_req = int(vad_cfg.get("speech_start_chunks", 2))
             silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 0.70))
             max_record_sec = float(vad_cfg.get("max_record_seconds", 14.0))
-            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 0.5))
+            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 1.0))
             capture_dir = RECORDINGS_DIR / ".capture"
 
             # 100ms chunk = 1600 samples = 3200 bytes (s16le mono)
@@ -1165,12 +1165,12 @@ class HandsFreeVAD(threading.Thread):
                     start_threshold = max(base_threshold, min(noise_floor * start_mult, 3600.0))
                     stop_threshold = max(base_threshold * 0.65, min(noise_floor * stop_mult, start_threshold * 0.78))
 
-                    # Sync with external hotkey toggles (e.g. Ctrl+Alt+Space) ONLY if capture file is >2.5s old and we didn't recently stop!
-                    if not recording_active and (now - self.last_stop_at) > 3.5 and int(now * 2) % 3 == 0:
+                    # Sync with external hotkey toggles (e.g. Ctrl+Alt+Space) ONLY if capture file exists for >1.8s and we didn't just stop!
+                    if not recording_active and (now - self.last_stop_at) > 2.5 and int(now * 5) % 4 == 0:
                         try:
                             if capture_dir.exists():
                                 wavs = list(capture_dir.glob("*.wav"))
-                                if wavs and (now - wavs[0].stat().st_mtime) < 1.0 and (now - wavs[0].stat().st_ctime) > 2.0:
+                                if wavs and (now - wavs[0].stat().st_ctime) > 1.8:
                                     recording_active = True
                                     recording_started_at = now
                                     last_voice_at = now
