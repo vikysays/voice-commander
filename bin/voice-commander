@@ -68,9 +68,12 @@ TERMINAL_CLASSES = {
 
 # Single-word noise fragments that are ignored when part of a multi-segment command retry
 NOISE_FRAGMENTS = {"open", "exit", "the", "a", "an", "uh", "um", "oh", "ah", "okay", "ok", "hey"}
+# Whisper / S1-Voice common silence & keyboard-click hallucinations to discard
 WHISPER_HALLUCINATIONS = {
     "thank you",
     "thank you very much",
+    "thank you very much mr president",
+    "thank you mr president",
     "thanks",
     "thanks for watching",
     "thank you for watching",
@@ -83,6 +86,14 @@ WHISPER_HALLUCINATIONS = {
     "amara.org",
     "...",
 }
+
+HALLUCINATION_PREFIXES = (
+    "thank you",
+    "thanks for watching",
+    "you're welcome",
+    "subtitles by",
+    "translated by",
+)
 
 BROWSER_CLASSES = {
     "chromium", "google-chrome", "chrome", "firefox", "brave", "brave-browser", "zen", "vivaldi",
@@ -430,9 +441,9 @@ class VoiceCommander:
         if not text:
             return {"status": "ignored", "reason": "empty"}
 
-        # Discard known Whisper background-noise / keyboard-click hallucinations ("Thank you.", "You're welcome.")
+        # Discard known Whisper background-noise / keyboard-click hallucinations ("Thank you.", "Thank you very much, Mr. President.")
         raw_norm_check = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", text.lower()).strip()
-        if raw_norm_check in WHISPER_HALLUCINATIONS:
+        if raw_norm_check in WHISPER_HALLUCINATIONS or any(raw_norm_check.startswith(p) for p in HALLUCINATION_PREFIXES):
             print(f"[voice-commander] Filtered Whisper noise hallucination: {text!r}", flush=True)
             return {"status": "ignored", "reason": "hallucination", "text": text}
 
@@ -456,8 +467,8 @@ class VoiceCommander:
                 has_wake, stripped_raw, stripped_norm = self._extract_wake_prefix(seg, wake_words)
                 # Use dry check for mode commands during pass 1 so we don't execute them before earlier dictation segments!
                 if stripped_norm in (
-                    "dictation mode", "start dictation", "enable dictation", "typing mode",
-                    "command mode", "stop dictation", "commands only", "enable command mode",
+                    "dictation mode", "start dictation", "enable dictation", "typing mode", "start typing",
+                    "command mode", "stop dictation", "stop typing", "commands only", "enable command mode",
                     "hybrid mode", "smart mode", "normal mode", "auto mode",
                     "hands free on", "hands-free on", "enable hands free", "enable hands-free", "auto listen on", "start listening",
                     "hands free off", "hands-free off", "disable hands free", "disable hands-free",
@@ -514,14 +525,16 @@ class VoiceCommander:
                             time.sleep(0.15)
                     else:
                         # Non-command segment inside a multi-segment utterance!
-                        # e.g. "I want you to put this on GitHub as a public repository. Enter. Stop listening."
-                        # If in hybrid or dictation mode, type meaningful sentences (>=2 words) in sequence BEFORE "Enter" runs!
+                        # Only type arbitrary non-command segments if in explicit "dictation" mode (or if require_type_prefix_in_hybrid is false)
+                        require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", True))
                         seg_clean = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", seg.strip())
                         seg_lower = seg_clean.lower()
+                        allow_free_typing = (self.mode == "dictation") or (self.mode == "hybrid" and not require_type_prefix)
                         if (
-                            self.mode in ("hybrid", "dictation")
+                            allow_free_typing
                             and not has_wake
                             and seg_lower not in WHISPER_HALLUCINATIONS
+                            and not any(seg_lower.startswith(p) for p in HALLUCINATION_PREFIXES)
                             and seg_lower not in NOISE_FRAGMENTS
                             and len(seg_clean.split()) >= 2
                         ):
@@ -557,10 +570,14 @@ class VoiceCommander:
                 return cmd_result
 
             # IMPORTANT: If the user explicitly said "Computer, <something>" or is in Command Mode,
-            # NEVER paste the unrecognized command as text into the active input box!
-            if has_wake_prefix or self.mode == "command":
-                self.alert("Voice Command Unknown", f"Ignored unknown command: \"{target_raw}\"")
-                return {"status": "unrecognized_command", "text": target_raw}
+            # or if require_type_prefix_in_hybrid is enabled (default), NEVER paste unrecognized speech/noise as text!
+            require_type_prefix = bool(self.config.get("general", {}).get("require_type_prefix_in_hybrid", True))
+            if has_wake_prefix or self.mode == "command" or (self.mode == "hybrid" and require_type_prefix):
+                if has_wake_prefix:
+                    self.alert("Voice Command Unknown", f"Ignored unknown command: \"{target_raw}\"")
+                else:
+                    print(f"[voice-commander] Ignored non-command speech in safe hybrid mode (say 'type ...' or 'start typing' to dictate): {target_raw!r}", flush=True)
+                return {"status": "ignored_non_command", "text": target_raw}
 
         # 3. Dictation fallback (normal speech without wake word)
         # Check if user ended dictation with "... press enter" or "... enter"
@@ -590,16 +607,16 @@ class VoiceCommander:
         return False, text.strip(), normalize_for_match(text)
 
     def _match_mode_command(self, norm: str) -> dict[str, Any] | None:
-        if norm in ("dictation mode", "start dictation", "enable dictation", "typing mode"):
+        if norm in ("dictation mode", "start dictation", "enable dictation", "typing mode", "start typing"):
             self.mode = "dictation"
             self.save_state()
-            self.alert("Mode Switched", "Dictation Mode (say 'Computer ...' for commands)")
+            self.alert("Mode Switched", "Dictation Mode (everything you say will be typed; say 'stop typing' when done)")
             return {"status": "mode_change", "mode": "dictation"}
 
-        if norm in ("command mode", "stop dictation", "commands only", "enable command mode"):
+        if norm in ("command mode", "stop dictation", "stop typing", "commands only", "enable command mode"):
             self.mode = "command"
             self.save_state()
-            self.alert("Mode Switched", "Command Mode (all speech treated as commands)")
+            self.alert("Mode Switched", "Command Mode (commands only; say 'type <text>' or 'start typing' to type)")
             return {"status": "mode_change", "mode": "command"}
 
         if norm in ("hybrid mode", "smart mode", "normal mode", "auto mode"):
@@ -1047,7 +1064,8 @@ class HandsFreeVAD(threading.Thread):
         super().__init__(daemon=True)
         self.commander = commander
         self.stop_event = stop_event
-        self.cooldown_until: float = 0.0
+        # Track when THIS thread just called superwhisper stop so we never re-attach to a finishing .capture/*.wav file!
+        self.last_stop_at: float = 0.0
 
     def trigger_cooldown(self, seconds: float = 0.9) -> None:
         self.cooldown_until = time.time() + seconds
@@ -1146,16 +1164,18 @@ class HandsFreeVAD(threading.Thread):
                     start_threshold = max(base_threshold, min(noise_floor * start_mult, 3600.0))
                     stop_threshold = max(base_threshold * 0.65, min(noise_floor * stop_mult, start_threshold * 0.78))
 
-                    # Sync with external hotkey toggles (e.g. Ctrl+Alt+Space) by checking .capture/*.wav!
-                    if not recording_active and int(now * 5) % 3 == 0:
+                    # Sync with external hotkey toggles (e.g. Ctrl+Alt+Space) ONLY if capture file is >2.5s old and we didn't recently stop!
+                    if not recording_active and (now - self.last_stop_at) > 3.5 and int(now * 2) % 3 == 0:
                         try:
-                            if capture_dir.exists() and any(capture_dir.glob("*.wav")):
-                                recording_active = True
-                                recording_started_at = now
-                                last_voice_at = now
-                                last_osd_at = now
-                                self.commander.is_recording = True
-                                print("[VAD] External Superwhisper recording detected -> tracking for auto-stop", flush=True)
+                            if capture_dir.exists():
+                                wavs = list(capture_dir.glob("*.wav"))
+                                if wavs and (now - wavs[0].stat().st_mtime) < 1.0 and (now - wavs[0].stat().st_ctime) > 2.0:
+                                    recording_active = True
+                                    recording_started_at = now
+                                    last_voice_at = now
+                                    last_osd_at = now
+                                    self.commander.is_recording = True
+                                    print("[VAD] External Superwhisper hotkey recording detected -> tracking for auto-stop", flush=True)
                         except Exception:
                             pass
 
@@ -1216,6 +1236,7 @@ class HandsFreeVAD(threading.Thread):
                             recording_active = False
                             active_speech_chunks = 0
                             self.commander.is_recording = False
+                            self.last_stop_at = now
                             self.cooldown_until = now + cooldown_sec
                             if live_osd:
                                 notify(
