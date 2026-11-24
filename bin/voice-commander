@@ -117,13 +117,13 @@ def load_config() -> dict[str, Any]:
         "vad": {
             "enabled": True,
             "sample_rate": 16000,
-            "energy_threshold": 3800,
-            "start_multiplier": 2.8,
-            "stop_multiplier": 1.75,
-            "speech_start_chunks": 3,
-            "silence_stop_seconds": 0.85,
+            "energy_threshold": 2400,
+            "start_multiplier": 2.3,
+            "stop_multiplier": 1.55,
+            "speech_start_chunks": 2,
+            "silence_stop_seconds": 0.70,
             "max_record_seconds": 14.0,
-            "cooldown_seconds": 1.0,
+            "cooldown_seconds": 0.5,
         },
         "apps": {
             "terminal": "omarchy-launch-terminal",
@@ -666,6 +666,30 @@ class VoiceCommander:
                 self.alert("Window Control", "Closed active window")
             return {"status": "command", "action": "close_window"}
 
+        # "close <app>" / "quit <app>" (e.g. "close the music", "close browser", "close terminal")
+        m = re.match(r"^(?:close|quit|kill|stop)\s+(?:the\s+)?(music|audacious|spotify|browser|chrome|chromium|terminal|files|editor)$", norm)
+        if m:
+            target_app = m.group(1)
+            proc_map = {
+                "music": "audacious",
+                "audacious": "audacious",
+                "spotify": "spotify",
+                "browser": "chromium",
+                "chrome": "chromium",
+                "chromium": "chromium",
+                "files": "nautilus",
+            }
+            if target_app in proc_map:
+                if not dry_check:
+                    run_bg(["pkill", "-f", proc_map[target_app]], shell=False)
+                    self.alert("Closed App", f"Closed {target_app.title()}")
+                return {"status": "command", "action": "close_app", "app": target_app}
+            else:
+                if not dry_check:
+                    run_bg(["hyprctl", "dispatch", "hl.dsp.window.close()"], shell=False)
+                    self.alert("Window Control", f"Closed {target_app.title()}")
+                return {"status": "command", "action": "close_window"}
+
         if norm in ("fullscreen", "full screen", "toggle fullscreen", "maximize", "maximize window", "expand window"):
             if not dry_check:
                 run_bg(["hyprctl", "dispatch", 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'], shell=False)
@@ -1044,13 +1068,14 @@ class HandsFreeVAD(threading.Thread):
             live_osd = bool(cfg.get("general", {}).get("live_osd", True))
             vad_cfg = cfg.get("vad", {})
             sample_rate = int(vad_cfg.get("sample_rate", 16000))
-            base_threshold = float(vad_cfg.get("energy_threshold", 2200))
-            start_mult = float(vad_cfg.get("start_multiplier", 2.4))
-            stop_mult = float(vad_cfg.get("stop_multiplier", 1.65))
+            base_threshold = float(vad_cfg.get("energy_threshold", 2400))
+            start_mult = float(vad_cfg.get("start_multiplier", 2.3))
+            stop_mult = float(vad_cfg.get("stop_multiplier", 1.55))
             start_chunks_req = int(vad_cfg.get("speech_start_chunks", 2))
-            silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 0.85))
+            silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 0.70))
             max_record_sec = float(vad_cfg.get("max_record_seconds", 14.0))
-            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 0.8))
+            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 0.5))
+            capture_dir = RECORDINGS_DIR / ".capture"
 
             # 100ms chunk = 1600 samples = 3200 bytes (s16le mono)
             chunk_samples = sample_rate // 10
@@ -1118,8 +1143,21 @@ class HandsFreeVAD(threading.Thread):
                     sum_sq = sum(s * s for s in samples)
                     rms = math.sqrt(sum_sq / count) if count > 0 else 0.0
 
-                    start_threshold = max(base_threshold, min(noise_floor * start_mult, 4800.0))
-                    stop_threshold = max(base_threshold * 0.72, min(noise_floor * stop_mult, start_threshold * 0.8))
+                    start_threshold = max(base_threshold, min(noise_floor * start_mult, 3600.0))
+                    stop_threshold = max(base_threshold * 0.65, min(noise_floor * stop_mult, start_threshold * 0.78))
+
+                    # Sync with external hotkey toggles (e.g. Ctrl+Alt+Space) by checking .capture/*.wav!
+                    if not recording_active and int(now * 5) % 3 == 0:
+                        try:
+                            if capture_dir.exists() and any(capture_dir.glob("*.wav")):
+                                recording_active = True
+                                recording_started_at = now
+                                last_voice_at = now
+                                last_osd_at = now
+                                self.commander.is_recording = True
+                                print("[VAD] External Superwhisper recording detected -> tracking for auto-stop", flush=True)
+                        except Exception:
+                            pass
 
                     if not recording_active:
                         if rms >= start_threshold:

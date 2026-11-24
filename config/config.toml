@@ -24,20 +24,20 @@ audio_device = "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo
 enabled = true
 # Sample rate in Hz
 sample_rate = 16000
-# Minimum RMS threshold to trigger speech start (sustained human voice, ignoring short keyboard clacks)
-energy_threshold = 3800
+# Minimum RMS threshold to trigger speech start (normal conversational speech on Samson GoMic is 2400-10000; ambient room floor is ~800-1200)
+energy_threshold = 2400
 # Adaptive noise floor multiplier
-start_multiplier = 2.8
+start_multiplier = 2.3
 # Adaptive stop hysteresis
-stop_multiplier = 1.75
-# Consecutive speech chunks (100ms each) required to trigger recording (3 chunks = 300ms sustained voice, filters out 50ms keyboard clicks!)
-speech_start_chunks = 3
+stop_multiplier = 1.55
+# Consecutive speech chunks (100ms each) required to trigger recording (2 chunks = 200ms instant start)
+speech_start_chunks = 2
 # Silence duration (seconds) after you finish a sentence to automatically stop & process immediately!
-silence_stop_seconds = 0.85
+silence_stop_seconds = 0.70
 # Maximum single recording duration (seconds) for hands-free trigger
 max_record_seconds = 14.0
 # Cooldown after stopping a recording before VAD starts listening again (seconds)
-cooldown_seconds = 1.0
+cooldown_seconds = 0.5
 
 [apps]
 # Phrase after "open / launch / start <app>" -> shell command
