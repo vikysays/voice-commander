@@ -37,11 +37,11 @@ stop_multiplier = 1.55
 # Consecutive speech chunks (100ms each) required to trigger recording (2 chunks = 200ms instant start)
 speech_start_chunks = 2
 # Silence duration (seconds) after you finish a sentence to automatically stop & process immediately!
-silence_stop_seconds = 0.70
+silence_stop_seconds = 1.05
 # Maximum single recording duration (seconds) for hands-free trigger
 max_record_seconds = 14.0
 # Cooldown after stopping a recording before VAD starts listening again (seconds)
-cooldown_seconds = 1.0
+cooldown_seconds = 1.2
 
 [apps]
 # Phrase after "open / launch / start <app>" -> shell command

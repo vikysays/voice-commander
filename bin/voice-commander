@@ -876,10 +876,11 @@ class VoiceCommander:
                 return {"status": "command", "action": "switch_tab", "tab": num}
 
         # --- C. APP LAUNCHING ---
-        m = re.match(r"^(?:open|launch|start|run\s+app)\s+(?:the\s+|a\s+|an\s+|up\s+)?(.+)$", norm)
-        if m:
-            target = m.group(1).strip()
-            target = re.sub(r"^(?:the\s+|a\s+|an\s+)", "", target).strip()
+        # Match "open your browser", "open my terminal", "launch the browser", or bare app names ("chromium", "browser", "terminal")
+        m = re.match(r"^(?:open|launch|start|run\s+app)\s+(?:the\s+|a\s+|an\s+|up\s+|your\s+|my\s+)?(.+)$", norm)
+        target = m.group(1).strip() if m else (norm if norm in apps else "")
+        if target:
+            target = re.sub(r"^(?:the\s+|a\s+|an\s+|your\s+|my\s+)", "", target).strip()
             if target in apps:
                 cmd = apps[target]
                 if not dry_check:
@@ -1091,9 +1092,9 @@ class HandsFreeVAD(threading.Thread):
             start_mult = float(vad_cfg.get("start_multiplier", 2.4))
             stop_mult = float(vad_cfg.get("stop_multiplier", 1.55))
             start_chunks_req = int(vad_cfg.get("speech_start_chunks", 2))
-            silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 0.70))
+            silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 1.05))
             max_record_sec = float(vad_cfg.get("max_record_seconds", 14.0))
-            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 1.0))
+            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 1.2))
             capture_dir = RECORDINGS_DIR / ".capture"
 
             # 100ms chunk = 1600 samples = 3200 bytes (s16le mono)
