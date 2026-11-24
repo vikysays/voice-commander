@@ -1,0 +1,109 @@
+# Voice Commander Configuration for Omarchy + Superwhisper + Samson GoMic
+
+[general]
+# Wake words that trigger a command even when in Dictation Mode (case-insensitive)
+wake_words = ["computer", "jarvis", "omarchy", "command", "system", "assistant", "agent"]
+
+# Default operating mode on startup:
+# - "hybrid": (Recommended) Commands execute actions, and normal sentences are typed into the focused window!
+# - "command": Only executes commands unless prefixed with "type" or "dictate".
+# - "dictation": Everything is typed unless prefixed with a wake word ("computer ...") or "command mode".
+default_mode = "hybrid"
+
+# Show desktop notifications (OSD) for recognized commands and mode switches
+notifications = true
+
+# Show live OSD recording timer & audio meter while you are speaking
+live_osd = true
+
+# Audio device for hands-free Voice Activity Detection (Samson GoMic)
+audio_device = "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo"
+
+[vad]
+# Enable hands-free voice activity detection on startup
+enabled = true
+# Sample rate in Hz
+sample_rate = 16000
+# Minimum RMS threshold to trigger speech start (sustained human voice, ignoring short keyboard clacks)
+energy_threshold = 3800
+# Adaptive noise floor multiplier
+start_multiplier = 2.8
+# Adaptive stop hysteresis
+stop_multiplier = 1.75
+# Consecutive speech chunks (100ms each) required to trigger recording (3 chunks = 300ms sustained voice, filters out 50ms keyboard clicks!)
+speech_start_chunks = 3
+# Silence duration (seconds) after you finish a sentence to automatically stop & process immediately!
+silence_stop_seconds = 0.85
+# Maximum single recording duration (seconds) for hands-free trigger
+max_record_seconds = 14.0
+# Cooldown after stopping a recording before VAD starts listening again (seconds)
+cooldown_seconds = 1.0
+
+[apps]
+# Phrase after "open / launch / start <app>" -> shell command
+"terminal" = "omarchy-launch-terminal"
+"console" = "omarchy-launch-terminal"
+"shell" = "omarchy-launch-terminal"
+"tmux" = "omarchy-launch-terminal-tmux"
+"herdr" = "omarchy-launch-terminal-herdr"
+"browser" = "omarchy-launch-browser"
+"chrome" = "omarchy-launch-browser"
+"chromium" = "omarchy-launch-browser"
+"web" = "omarchy-launch-browser"
+"web browser" = "omarchy-launch-browser"
+"files" = "omarchy-launch-nautilus"
+"file manager" = "omarchy-launch-nautilus"
+"nautilus" = "omarchy-launch-nautilus"
+"folder" = "omarchy-launch-nautilus"
+"editor" = "omarchy-launch-editor"
+"neovim" = "omarchy-launch-editor"
+"vim" = "omarchy-launch-editor"
+"code" = "omarchy-launch-editor"
+"music" = "audacious"
+"audacious" = "audacious"
+"spotify" = "omarchy-launch-spotify"
+"discord" = "omarchy-launch-discord-community"
+"signal" = "omarchy-launch-signal"
+"docker" = "omarchy-launch-docker-tui"
+"settings" = "superwhisper settings"
+"superwhisper" = "superwhisper settings"
+"monitor" = "omarchy-launch-tui btop"
+"system monitor" = "omarchy-launch-tui btop"
+"btop" = "omarchy-launch-tui btop"
+
+[websites]
+# Phrase after "go to / open <site>" -> URL opened in browser
+"google" = "https://www.google.com"
+"youtube" = "https://www.youtube.com"
+"github" = "https://github.com"
+"chatgpt" = "https://chatgpt.com"
+"gmail" = "https://mail.google.com"
+"reddit" = "https://www.reddit.com"
+"hacker news" = "https://news.ycombinator.com"
+"x" = "https://x.com"
+"twitter" = "https://x.com"
+"linkedin" = "https://www.linkedin.com"
+"wikipedia" = "https://www.wikipedia.org"
+
+[terminal_shortcuts]
+# Natural language terminal phrases after "run <phrase>" or direct in terminal
+"list files" = "ls -la"
+"status" = "git status"
+"git status" = "git status"
+"git diff" = "git diff"
+"git log" = "git log --oneline -n 10"
+"git pull" = "git pull"
+"clear" = "clear"
+"clear terminal" = "clear"
+"clear screen" = "clear"
+"current directory" = "pwd"
+"go home" = "cd ~"
+"go back" = "cd .."
+"go up" = "cd .."
+"go to downloads" = "cd ~/Downloads && ls -la"
+"go to documents" = "cd ~/Documents && ls -la"
+"go to desktop" = "cd ~/Desktop && ls -la"
+"disk usage" = "df -h"
+"memory usage" = "free -h"
+"processes" = "ps aux | head -n 20"
+"update system" = "omarchy update"

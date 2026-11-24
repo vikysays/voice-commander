@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Voice Commander v2 Desktop Architecture",
+    "output": ".archify/architecture-voice-commander-20261124-203315/voice-commander.html",
+    "quality_profile": "showcase"
+  },
+  "layout": {
+    "mode": "auto"
+  },
+  "components": [
+    {
+      "id": "mic",
+      "type": "external",
+      "label": "Samson GoMic",
+      "sublabel": "USB Condenser Mic",
+      "tag": "PipeWire ALSA Source",
+      "explanation": "Samson GoMic USB condenser microphone kept awake via keepMicrophoneReady in WirePlumber so the first spoken syllable is never clipped."
+    },
+    {
+      "id": "hotkey",
+      "type": "external",
+      "label": "Manual Hotkey",
+      "sublabel": "Ctrl+Alt+Space",
+      "tag": "Push-to-Toggle",
+      "explanation": "Global Hyprland shortcut to manually start or stop Superwhisper recording when hands-free VAD is paused."
+    },
+    {
+      "id": "vad",
+      "type": "backend",
+      "label": "Adaptive VAD Thread",
+      "sublabel": "pw-cat 16kHz PCM",
+      "tag": "0.85s Silence Stop",
+      "explanation": "Continuously computes 100ms RMS energy and rolling median room noise floor (~950 RMS). Starts recording at >=2200 RMS and stops after 0.85s of silence."
+    },
+    {
+      "id": "osd",
+      "type": "frontend",
+      "label": "Live OSD Meter",
+      "sublabel": "notify-send Sync",
+      "tag": "Runtime Feedback",
+      "explanation": "Displays real-time audio level bars and countdown timer while speaking, plus command confirmation alerts."
+    },
+    {
+      "id": "sw_daemon",
+      "type": "backend",
+      "label": "Superwhisper Service",
+      "sublabel": "superwhisper.service",
+      "tag": "autoPaste: false",
+      "explanation": "Systemd user daemon that captures microphone audio and coordinates transcription without blindly auto-pasting into focused apps."
+    },
+    {
+      "id": "sw_cloud",
+      "type": "cloud",
+      "label": "Superwhisper Cloud",
+      "sublabel": "S1-Voice + S1-Language",
+      "tag": "Low-RAM STT",
+      "explanation": "Cloud speech-to-text and LLM formatting engine (~1.0s turnaround) keeping local RAM usage under 2 MB on the i5-4260U."
+    },
+    {
+      "id": "rec_store",
+      "type": "database",
+      "label": "Recordings Store",
+      "sublabel": "recordings/<ts>/meta.json",
+      "tag": "JSON Transcripts",
+      "explanation": "Local directory where Superwhisper writes completed transcription metadata and text results."
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "Voice Commander Router",
+      "sublabel": "~/.local/bin/voice-commander",
+      "tag": "Multi-Command Split",
+      "explanation": "Watches meta.json completions, splits compound utterances on wake words (Computer/Assistant/Omarchy), strips polite phrases, and routes intents."
+    },
+    {
+      "id": "cfg_store",
+      "type": "database",
+      "label": "Config & State Store",
+      "sublabel": "config.toml / state.json",
+      "tag": "Hot-Reload",
+      "explanation": "Stores wake words, VAD thresholds, app mappings, websites, terminal shortcuts, and active mode (Hybrid, Command, Dictation)."
+    },
+    {
+      "id": "wm_exec",
+      "type": "backend",
+      "label": "App & WM Executor",
+      "sublabel": "omarchy-launch / hyprctl",
+      "tag": "Hyprland IPC",
+      "explanation": "Launches desktop apps (Terminal, Chromium, Nautilus, Editor), switches workspaces 1-10, toggles fullscreen, and adjusts volume/brightness."
+    },
+    {
+      "id": "browser_agent",
+      "type": "frontend",
+      "label": "Browser Personal Agent",
+      "sublabel": "Quick-Find Link Clicker",
+      "tag": "Chromium Automation",
+      "explanation": "Automates web navigation ('take me to...'), YouTube/GitHub search, tab switching, and link clicking by text via Ctrl+F -> text -> Escape -> Enter."
+    },
+    {
+      "id": "key_inj",
+      "type": "frontend",
+      "label": "Key & Text Injector",
+      "sublabel": "wtype / wl-copy",
+      "tag": "Wayland Input",
+      "explanation": "Types dictated sentences into focused apps (Herdr/Antigravity), executes smart terminal commands with Enter, and sends key chords."
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Omarchy Linux Desktop (systemd --user graphical-session.target)",
+      "wraps": [
+        "vad",
+        "osd",
+        "sw_daemon",
+        "rec_store",
+        "router",
+        "cfg_store",
+        "wm_exec",
+        "browser_agent",
+        "key_inj"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "voice-commander.service (Python 3 Daemon)",
+      "wraps": [
+        "vad",
+        "router",
+        "cfg_store"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "mic-to-vad",
+      "from": "mic",
+      "to": "vad",
+      "label": "16kHz PCM stream",
+      "variant": "emphasis"
+    },
+    {
+      "id": "mic-to-sw",
+      "from": "mic",
+      "to": "sw_daemon",
+      "label": "audio capture"
+    },
+    {
+      "id": "hotkey-to-sw",
+      "from": "hotkey",
+      "to": "sw_daemon",
+      "label": "toggle record",
+      "variant": "dashed"
+    },
+    {
+      "id": "vad-to-sw",
+      "from": "vad",
+      "to": "sw_daemon",
+      "label": "start / stop CLI",
+      "variant": "emphasis"
+    },
+    {
+      "id": "vad-to-osd",
+      "from": "vad",
+      "to": "osd",
+      "label": "live mic meter",
+      "variant": "dashed"
+    },
+    {
+      "id": "sw-to-cloud",
+      "from": "sw_daemon",
+      "to": "sw_cloud",
+      "label": "HTTPS audio",
+      "variant": "emphasis"
+    },
+    {
+      "id": "sw-to-store",
+      "from": "sw_daemon",
+      "to": "rec_store",
+      "label": "write meta.json",
+      "variant": "emphasis"
+    },
+    {
+      "id": "store-to-router",
+      "from": "rec_store",
+      "to": "router",
+      "label": "100ms watcher",
+      "variant": "emphasis"
+    },
+    {
+      "id": "cfg-to-router",
+      "from": "cfg_store",
+      "to": "router",
+      "label": "hot-reload rules"
+    },
+    {
+      "id": "router-to-osd",
+      "from": "router",
+      "to": "osd",
+      "label": "action alert",
+      "variant": "dashed"
+    },
+    {
+      "id": "router-to-wm",
+      "from": "router",
+      "to": "wm_exec",
+      "label": "apps & workspaces",
+      "variant": "emphasis"
+    },
+    {
+      "id": "router-to-browser",
+      "from": "router",
+      "to": "browser_agent",
+      "label": "navigate & click links",
+      "variant": "emphasis"
+    },
+    {
+      "id": "router-to-key",
+      "from": "router",
+      "to": "key_inj",
+      "label": "dictation & shell cmds",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "1. Adaptive Audio & VAD",
+      "items": [
+        "Samson GoMic kept ready via WirePlumber hook",
+        "Rolling median noise floor (~950 RMS) prevents 25s hangs",
+        "Auto-stops 0.85s after speech ends with live OSD meter"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "2. Multi-Command Router",
+      "items": [
+        "Splits compound sentences on wake words (Computer / Assistant)",
+        "Strips polite phrasing ('Can you please...') and deduplicates",
+        "Never leaks wake-word commands into active text boxes"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "3. Personal Desktop & Browser Agent",
+      "items": [
+        "Clicks webpage links by name via Ctrl+F Quick-Find sequence",
+        "Launches Omarchy apps, switches Hyprland workspaces 1-10",
+        "Executes terminal commands or types dictation via wtype"
+      ]
+    }
+  ]
+}

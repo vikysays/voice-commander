@@ -1,0 +1,1340 @@
+#!/usr/bin/env python3
+"""
+Voice Commander v2 for Omarchy Linux + Superwhisper + Samson GoMic.
+
+Upgrades in v2:
+1. Adaptive Noise-Floor VAD + Hysteresis:
+   - Dynamically tracks ambient room noise on the Samson GoMic so background hum (RMS 700-1100)
+     never holds the recording open for 25 seconds.
+   - Stops recording within 0.85s after you finish speaking.
+2. Live Runtime Recording OSD + Superwhisper Realtime Preview:
+   - Shows a live updating desktop OSD indicator ("Listening... 1.2s [||||..]") while speaking.
+3. Multi-Command & Conversational Command Extraction:
+   - Splits compound utterances ("Exit. Computer workspace two. Computer open terminal.") and
+     extracts embedded wake-word commands ("Open. Can you please open the browser? Computer, open the browser.")
+     so they NEVER get typed into active input fields like Herdr/Antigravity.
+   - Strips polite conversational wrappers ("can you please", "could you", "please", "actually").
+   - Supports trailing inline actions like "... over", "... enter", "... press enter".
+4. Personal Browser & Desktop Agent ("Computer, find link ...", "Computer, open first result",
+   "Computer, click on ...", "Computer, search on page for ...", "Computer, ask assistant ..."):
+   - Directly controls browser navigation, link clicking via Quick Find (`'` / Ctrl+F + Enter),
+     URL bar typing, form filling, tab switching, and launching/prompting AI assistant tasks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote_plus
+
+CONFIG_PATH = Path.home() / ".config" / "voice-commander" / "config.toml"
+STATE_PATH = Path.home() / ".local" / "state" / "voice-commander" / "state.json"
+RECORDINGS_DIR = Path.home() / ".local" / "share" / "superwhisper" / "recordings"
+
+DRY_RUN = False
+
+NUMBER_WORDS: dict[str, int] = {
+    "one": 1, "won": 1, "first": 1, "1": 1, "1st": 1,
+    "two": 2, "to": 2, "too": 2, "second": 2, "2": 2, "2nd": 2,
+    "three": 3, "third": 3, "3": 3, "3rd": 3,
+    "four": 4, "for": 4, "fourth": 4, "4": 4, "4th": 4,
+    "five": 5, "fifth": 5, "5": 5, "5th": 5,
+    "six": 6, "sixth": 6, "6": 6, "6th": 6,
+    "seven": 7, "seventh": 7, "7": 7, "7th": 7,
+    "eight": 8, "eighth": 8, "8": 8, "8th": 8,
+    "nine": 9, "ninth": 9, "9": 9, "9th": 9,
+    "ten": 10, "tenth": 10, "10": 10, "10th": 10,
+}
+
+TERMINAL_CLASSES = {
+    "alacritty", "foot", "kitty", "com.mitchellh.ghostty", "ghostty",
+    "wezterm", "org.wezfurlong.wezterm", "xterm", "konsole", "gnome-terminal",
+    "org.omarchy.agent", "herdr",
+}
+
+# Single-word noise fragments that are ignored when part of a multi-segment command retry
+NOISE_FRAGMENTS = {"open", "exit", "the", "a", "an", "uh", "um", "oh", "ah", "okay", "ok", "hey"}
+WHISPER_HALLUCINATIONS = {
+    "thank you",
+    "thank you very much",
+    "thanks",
+    "thanks for watching",
+    "thank you for watching",
+    "you're welcome",
+    "you are welcome",
+    "bye",
+    "bye bye",
+    "goodbye",
+    "subtitles by",
+    "amara.org",
+    "...",
+}
+
+BROWSER_CLASSES = {
+    "chromium", "google-chrome", "chrome", "firefox", "brave", "brave-browser", "zen", "vivaldi",
+}
+
+POLITE_PREFIX_RE = re.compile(
+    r"^(?:can\s+you\s+please|could\s+you\s+please|would\s+you\s+please|can\s+you|could\s+you|would\s+you|please|just|now|i\s+want\s+you\s+to|i\s+want\s+to)\s+",
+    flags=re.IGNORECASE,
+)
+
+POLITE_SUFFIX_RE = re.compile(
+    r"\s+(?:please|for\s+me|right\s+now|now|actually|thank\s+you|thanks)$",
+    flags=re.IGNORECASE,
+)
+
+
+def load_config() -> dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open("rb") as f:
+                return tomllib.load(f)
+        except Exception as e:
+            print(f"[voice-commander] Error loading config.toml: {e}", file=sys.stderr)
+    return {
+        "general": {
+            "wake_words": ["computer", "jarvis", "omarchy", "command", "system", "assistant", "agent"],
+            "default_mode": "command",
+            "notifications": True,
+            "live_osd": True,
+            "audio_device": "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo",
+        },
+        "vad": {
+            "enabled": True,
+            "sample_rate": 16000,
+            "energy_threshold": 3800,
+            "start_multiplier": 2.8,
+            "stop_multiplier": 1.75,
+            "speech_start_chunks": 3,
+            "silence_stop_seconds": 0.85,
+            "max_record_seconds": 14.0,
+            "cooldown_seconds": 1.0,
+        },
+        "apps": {
+            "terminal": "omarchy-launch-terminal",
+            "console": "omarchy-launch-terminal",
+            "shell": "omarchy-launch-terminal",
+            "tmux": "omarchy-launch-terminal-tmux",
+            "herdr": "omarchy-launch-terminal-herdr",
+            "browser": "omarchy-launch-browser",
+            "chrome": "omarchy-launch-browser",
+            "chromium": "omarchy-launch-browser",
+            "web": "omarchy-launch-browser",
+            "web browser": "omarchy-launch-browser",
+            "files": "omarchy-launch-nautilus",
+            "file manager": "omarchy-launch-nautilus",
+            "nautilus": "omarchy-launch-nautilus",
+            "editor": "omarchy-launch-editor",
+            "code": "omarchy-launch-editor",
+            "music": "audacious",
+            "audacious": "audacious",
+            "settings": "superwhisper settings",
+            "superwhisper": "superwhisper settings",
+            "monitor": "omarchy-launch-tui btop",
+            "system monitor": "omarchy-launch-tui btop",
+            "btop": "omarchy-launch-tui btop",
+        },
+        "websites": {
+            "google": "https://www.google.com",
+            "youtube": "https://www.youtube.com",
+            "github": "https://github.com",
+            "chatgpt": "https://chatgpt.com",
+            "gmail": "https://mail.google.com",
+            "reddit": "https://www.reddit.com",
+            "hacker news": "https://news.ycombinator.com",
+            "x": "https://x.com",
+            "twitter": "https://x.com",
+            "linkedin": "https://www.linkedin.com",
+            "wikipedia": "https://www.wikipedia.org",
+        },
+        "terminal_shortcuts": {
+            "list files": "ls -la",
+            "status": "git status",
+            "git status": "git status",
+            "git diff": "git diff",
+            "clear": "clear",
+            "clear terminal": "clear",
+            "go to downloads": "cd ~/Downloads && ls -la",
+        },
+    }
+
+
+def notify(
+    title: str,
+    body: str,
+    urgency: str = "low",
+    timeout_ms: int = 2200,
+    sync_tag: str = "voice-commander",
+) -> None:
+    if DRY_RUN:
+        return
+    try:
+        subprocess.Popen(
+            [
+                "notify-send",
+                "-a", "Voice Commander",
+                "-u", urgency,
+                "-t", str(timeout_ms),
+                "-h", f"string:x-canonical-private-synchronous:{sync_tag}",
+                title,
+                body,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def run_bg(cmd: str | list[str], shell: bool = False) -> None:
+    if DRY_RUN:
+        return
+    try:
+        if isinstance(cmd, str) and not shell:
+            shell = True
+        subprocess.Popen(
+            cmd,
+            shell=shell,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        print(f"[voice-commander] Failed to run {cmd}: {e}", file=sys.stderr)
+
+
+def get_active_window_info() -> dict[str, Any]:
+    try:
+        res = subprocess.run(
+            ["hyprctl", "activewindow", "-j"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+    return {}
+
+
+def get_active_window_class() -> str:
+    data = get_active_window_info()
+    return (data.get("class") or "").lower()
+
+
+def is_terminal_focused() -> bool:
+    data = get_active_window_info()
+    cls = (data.get("class") or "").lower()
+    title = (data.get("title") or "").lower()
+    tags = [str(t).lower() for t in (data.get("tags") or [])]
+    if any("terminal" in t for t in tags):
+        return True
+    if any(t in cls or t in title for t in TERMINAL_CLASSES):
+        return True
+    return False
+
+
+def is_browser_focused() -> bool:
+    cls = get_active_window_class()
+    return any(b in cls for b in BROWSER_CLASSES)
+
+
+def focus_or_launch_browser() -> None:
+    if DRY_RUN:
+        return
+    if not is_browser_focused():
+        run_bg(["omarchy-launch-browser"])
+        time.sleep(0.35)
+
+
+def type_text(text: str, press_enter: bool = False) -> None:
+    if DRY_RUN or (not text and not press_enter):
+        return
+    if text:
+        if shutil.which("wtype"):
+            subprocess.run(["wtype", "--", text], check=False)
+        elif shutil.which("wl-copy"):
+            subprocess.run(["wl-copy", "--", text], check=False)
+    if press_enter and shutil.which("wtype"):
+        subprocess.run(["wtype", "-k", "Return"], check=False)
+
+
+def press_key(key: str, mods: list[str] | None = None) -> None:
+    if DRY_RUN or not shutil.which("wtype"):
+        return
+    cmd = ["wtype", "-d", "15"]
+    if mods:
+        for m in mods:
+            cmd.extend(["-M", m])
+    if len(key) == 1 and key.isalnum():
+        cmd.append(key)
+    else:
+        cmd.extend(["-k", key])
+    if mods:
+        for m in reversed(mods):
+            cmd.extend(["-m", m])
+    subprocess.run(cmd, check=False)
+
+
+def browser_click_link_by_text(link_text: str) -> None:
+    """
+    Agentic browser interaction: uses Chromium/Firefox Find (Ctrl+F), types the link text,
+    presses Escape (which leaves focus on the matched link/element in Chromium), and presses Enter!
+    """
+    if DRY_RUN:
+        return
+    focus_or_launch_browser()
+    # 1. Open Find bar (Ctrl+F)
+    press_key("f", ["ctrl"])
+    time.sleep(0.12)
+    # 2. Type target link text
+    type_text(link_text, press_enter=False)
+    time.sleep(0.18)
+    # 3. Press Enter to jump to first match, then Escape to close Find bar while keeping focus on link, then Enter to click
+    press_key("Return")
+    time.sleep(0.12)
+    press_key("Escape")
+    time.sleep(0.12)
+    press_key("Return")
+
+
+def browser_navigate_to(url_or_query: str) -> None:
+    """
+    Types or navigates directly in the active browser tab (Ctrl+L -> type -> Enter).
+    """
+    if DRY_RUN:
+        return
+    focus_or_launch_browser()
+    press_key("l", ["ctrl"])
+    time.sleep(0.12)
+    type_text(url_or_query, press_enter=True)
+
+
+def normalize_for_match(text: str) -> str:
+    s = text.strip().lower()
+    s = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    # Strip polite conversational prefixes/suffixes repeatedly
+    for _ in range(2):
+        s2 = POLITE_PREFIX_RE.sub("", s).strip()
+        s2 = POLITE_SUFFIX_RE.sub("", s2).strip()
+        if s2 == s:
+            break
+        s = s2
+    return s
+
+
+def extract_number(token: str) -> int | None:
+    token = token.strip().lower()
+    if token in NUMBER_WORDS:
+        return NUMBER_WORDS[token]
+    if token.isdigit():
+        return int(token)
+    return None
+
+
+class VoiceCommander:
+    def __init__(self) -> None:
+        self.config = load_config()
+        general = self.config.get("general", {})
+        self.mode: str = general.get("default_mode", "hybrid")
+        self.notifications: bool = bool(general.get("notifications", True))
+        self.live_osd: bool = bool(general.get("live_osd", True))
+        self.vad_enabled: bool = bool(self.config.get("vad", {}).get("enabled", True))
+        self.last_typed_text: str = ""
+        self.is_recording: bool = False
+        self.load_state()
+        self.save_state()
+
+    def load_state(self) -> None:
+        if STATE_PATH.exists():
+            try:
+                data = json.loads(STATE_PATH.read_text())
+                self.mode = data.get("mode", self.mode)
+                self.vad_enabled = data.get("vad_enabled", self.vad_enabled)
+            except Exception:
+                pass
+
+    def save_state(self) -> None:
+        try:
+            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            STATE_PATH.write_text(
+                json.dumps(
+                    {
+                        "mode": self.mode,
+                        "vad_enabled": self.vad_enabled,
+                        "updated_at": time.time(),
+                    },
+                    indent=2,
+                )
+            )
+        except Exception:
+            pass
+
+    def alert(self, title: str, body: str) -> None:
+        print(f"[{title}] {body}", flush=True)
+        if self.notifications:
+            notify(title, body)
+
+    def _split_into_segments(self, raw_text: str, wake_words: list[str]) -> list[str]:
+        """
+        Splits a multi-sentence or multi-command utterance into clean segments.
+        Example:
+          "Exit Computer Workspace Two. Computer Open Terminal."
+          -> ["Exit", "Computer Workspace Two", "Computer Open Terminal"]
+          "Open. Can you please open the browser? Computer, open the browser."
+          -> ["Open", "Can you please open the browser", "Computer, open the browser"]
+        """
+        # First, insert a sentence boundary before any wake word that appears mid-sentence
+        # UNLESS it's inside quotes ("computer open chromium") indicating the user is talking *about* a command
+        if '"' in raw_text or "for example" in raw_text.lower() or "if i say" in raw_text.lower():
+            return [raw_text]
+
+        text = raw_text.strip()
+        wake_group = "|".join(re.escape(w) for w in wake_words)
+        # Split before wake words preceded by whitespace
+        text = re.sub(
+            rf"(?<=[a-zA-Z0-9.,!?])\s+(?=(?:hey\s+|ok\s+)?(?:{wake_group})\b)",
+            " |SPLIT| ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Also split on sentence-ending punctuation (. ? !) when followed by space
+        parts = re.split(r"\s*\|\SPLIT\|\s*|(?<=[.!?])\s+", text)
+        cleaned = [p.strip() for p in parts if p and p.strip()]
+        return cleaned if cleaned else [raw_text]
+
+    def handle_utterance(self, raw_text: str) -> dict[str, Any]:
+        """
+        Routes a single transcribed utterance (or compound multi-command utterance)
+        to either desktop commands, agentic browser actions, or text typing.
+        """
+        self.config = load_config()
+        text = raw_text.strip()
+        if not text:
+            return {"status": "ignored", "reason": "empty"}
+
+        # Discard known Whisper background-noise / keyboard-click hallucinations ("Thank you.", "You're welcome.")
+        raw_norm_check = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", text.lower()).strip()
+        if raw_norm_check in WHISPER_HALLUCINATIONS:
+            print(f"[voice-commander] Filtered Whisper noise hallucination: {text!r}", flush=True)
+            return {"status": "ignored", "reason": "hallucination", "text": text}
+
+        # Remove trailing "over" or "done" that user says to signal end of speech
+        text = re.sub(r"[\s,.;!]*(?:over and out|over|i am done|i'm done|done speaking)[\s.!?]*$", "", text, flags=re.IGNORECASE).strip()
+        if not text:
+            return {"status": "ignored", "reason": "stop_word_only"}
+
+        wake_words: list[str] = [
+            w.lower() for w in self.config.get("general", {}).get("wake_words", ["computer"])
+        ]
+
+        segments = self._split_into_segments(text, wake_words)
+
+        # If multiple segments were spoken and AT LEAST ONE is a valid command,
+        # execute all valid command segments and ignore false-start fragments (like "Open." before "Computer, open the browser.")
+        if len(segments) > 1:
+            parsed_segments: list[tuple[str, dict[str, Any] | None, bool]] = []
+            any_command = False
+            for seg in segments:
+                has_wake, stripped_raw, stripped_norm = self._extract_wake_prefix(seg, wake_words)
+                # Use dry check for mode commands during pass 1 so we don't execute them before earlier dictation segments!
+                if stripped_norm in (
+                    "dictation mode", "start dictation", "enable dictation", "typing mode",
+                    "command mode", "stop dictation", "commands only", "enable command mode",
+                    "hybrid mode", "smart mode", "normal mode", "auto mode",
+                    "hands free on", "hands-free on", "enable hands free", "enable hands-free", "auto listen on", "start listening",
+                    "hands free off", "hands-free off", "disable hands free", "disable hands-free",
+                    "auto listen off", "stop listening", "pause listening", "don't listen", "do not listen", "don't listen right now",
+                ):
+                    any_command = True
+                    parsed_segments.append((seg, {"_deferred_mode": stripped_norm}, True))
+                    continue
+                cmd_res = self._try_execute_command(
+                    stripped_raw,
+                    stripped_norm,
+                    strict_only=(self.mode == "hybrid" and not has_wake),
+                    dry_check=True,
+                )
+                if cmd_res is not None:
+                    any_command = True
+                    parsed_segments.append((seg, None, has_wake))
+                else:
+                    parsed_segments.append((seg, None, has_wake))
+
+            if any_command:
+                executed_results = []
+                last_sig = None
+                for seg, pre_res, has_wake in parsed_segments:
+                    if pre_res:
+                        if "_deferred_mode" in pre_res:
+                            m_res = self._match_mode_command(pre_res["_deferred_mode"])
+                            if m_res:
+                                executed_results.append(m_res)
+                        else:
+                            executed_results.append(pre_res)
+                        continue
+                    _, stripped_raw, stripped_norm = self._extract_wake_prefix(seg, wake_words)
+                    # Check dry signature first to skip consecutive identical retries ("open browser. computer open browser")
+                    dry_res = self._try_execute_command(
+                        stripped_raw,
+                        stripped_norm,
+                        strict_only=(self.mode == "hybrid" and not has_wake),
+                        dry_check=True,
+                    )
+                    if dry_res is not None:
+                        sig = json.dumps(dry_res, sort_keys=True)
+                        if sig == last_sig:
+                            continue
+                        last_sig = sig
+                        res = self._try_execute_command(
+                            stripped_raw,
+                            stripped_norm,
+                            strict_only=(self.mode == "hybrid" and not has_wake),
+                            dry_check=False,
+                        )
+                        if res is not None:
+                            executed_results.append(res)
+                            time.sleep(0.15)
+                    else:
+                        # Non-command segment inside a multi-segment utterance!
+                        # e.g. "I want you to put this on GitHub as a public repository. Enter. Stop listening."
+                        # If in hybrid or dictation mode, type meaningful sentences (>=2 words) in sequence BEFORE "Enter" runs!
+                        seg_clean = re.sub(r"^[,.\-!?:;\"']+|[,.\-!?:;\"']+$", "", seg.strip())
+                        seg_lower = seg_clean.lower()
+                        if (
+                            self.mode in ("hybrid", "dictation")
+                            and not has_wake
+                            and seg_lower not in WHISPER_HALLUCINATIONS
+                            and seg_lower not in NOISE_FRAGMENTS
+                            and len(seg_clean.split()) >= 2
+                        ):
+                            self.last_typed_text = seg.strip()
+                            type_text(seg.strip() + " ", press_enter=False)
+                            self.alert("Voice Dictation", f"Typed: {seg.strip()}")
+                            executed_results.append({"status": "typed", "text": seg.strip()})
+                            time.sleep(0.15)
+                if len(executed_results) == 1:
+                    return executed_results[0]
+                return {"status": "multi_command", "results": executed_results}
+
+        # Single segment processing
+        has_wake_prefix, stripped_text, stripped_norm = self._extract_wake_prefix(text, wake_words)
+        norm = normalize_for_match(text)
+
+        # 1. Mode switching commands
+        mode_action = self._match_mode_command(stripped_norm if has_wake_prefix else norm)
+        if mode_action:
+            return mode_action
+
+        # 2. Command or Agentic Action execution
+        if has_wake_prefix or self.mode in ("command", "hybrid"):
+            target_raw = stripped_text if has_wake_prefix else text
+            target_norm = stripped_norm if has_wake_prefix else norm
+            cmd_result = self._try_execute_command(
+                target_raw,
+                target_norm,
+                strict_only=(self.mode == "hybrid" and not has_wake_prefix),
+                dry_check=False,
+            )
+            if cmd_result is not None:
+                return cmd_result
+
+            # IMPORTANT: If the user explicitly said "Computer, <something>" or is in Command Mode,
+            # NEVER paste the unrecognized command as text into the active input box!
+            if has_wake_prefix or self.mode == "command":
+                self.alert("Voice Command Unknown", f"Ignored unknown command: \"{target_raw}\"")
+                return {"status": "unrecognized_command", "text": target_raw}
+
+        # 3. Dictation fallback (normal speech without wake word)
+        # Check if user ended dictation with "... press enter" or "... enter"
+        press_enter_after = False
+        dictation_text = text
+        if re.search(r"[\s,]+(?:and\s+)?(?:press\s+enter|hit\s+enter|send\s+message|submit)[.!?]*$", dictation_text, flags=re.IGNORECASE):
+            dictation_text = re.sub(
+                r"[\s,]+(?:and\s+)?(?:press\s+enter|hit\s+enter|send\s+message|submit)[.!?]*$",
+                "",
+                dictation_text,
+                flags=re.IGNORECASE,
+            ).strip()
+            press_enter_after = True
+
+        self.last_typed_text = dictation_text
+        type_text(dictation_text + ("" if press_enter_after else " "), press_enter=press_enter_after)
+        self.alert("Voice Dictation", f"Typed: {dictation_text}{' [Enter]' if press_enter_after else ''}")
+        return {"status": "typed", "text": dictation_text, "enter": press_enter_after}
+
+    def _extract_wake_prefix(self, text: str, wake_words: list[str]) -> tuple[bool, str, str]:
+        for w in wake_words:
+            pattern = rf"^(?:hey\s+|ok\s+|okay\s+|hi\s+)?{re.escape(w)}[\s,.:;!\-]*(.+)$"
+            m = re.match(pattern, text.strip(), flags=re.IGNORECASE)
+            if m:
+                stripped = m.group(1).strip()
+                return True, stripped, normalize_for_match(stripped)
+        return False, text.strip(), normalize_for_match(text)
+
+    def _match_mode_command(self, norm: str) -> dict[str, Any] | None:
+        if norm in ("dictation mode", "start dictation", "enable dictation", "typing mode"):
+            self.mode = "dictation"
+            self.save_state()
+            self.alert("Mode Switched", "Dictation Mode (say 'Computer ...' for commands)")
+            return {"status": "mode_change", "mode": "dictation"}
+
+        if norm in ("command mode", "stop dictation", "commands only", "enable command mode"):
+            self.mode = "command"
+            self.save_state()
+            self.alert("Mode Switched", "Command Mode (all speech treated as commands)")
+            return {"status": "mode_change", "mode": "command"}
+
+        if norm in ("hybrid mode", "smart mode", "normal mode", "auto mode"):
+            self.mode = "hybrid"
+            self.save_state()
+            self.alert("Mode Switched", "Hybrid Mode (commands + natural typing)")
+            return {"status": "mode_change", "mode": "hybrid"}
+
+        if norm in ("hands free on", "hands-free on", "enable hands free", "enable hands-free", "auto listen on", "start listening"):
+            self.vad_enabled = True
+            self.save_state()
+            self.alert("Hands-Free VAD", "Enabled continuous microphone voice detection")
+            return {"status": "vad_change", "vad_enabled": True}
+
+        if norm in (
+            "hands free off", "hands-free off", "disable hands free", "disable hands-free",
+            "auto listen off", "stop listening", "pause listening", "don't listen", "do not listen",
+            "don't listen right now",
+        ):
+            self.vad_enabled = False
+            self.save_state()
+            self.alert("Hands-Free VAD", "Paused continuous listening (use hotkey Ctrl+Alt+Space)")
+            return {"status": "vad_change", "vad_enabled": False}
+
+        return None
+
+    def _try_execute_command(
+        self, raw: str, norm: str, strict_only: bool = False, dry_check: bool = False
+    ) -> dict[str, Any] | None:
+        apps: dict[str, str] = self.config.get("apps", {})
+        websites: dict[str, str] = self.config.get("websites", {})
+        term_shortcuts: dict[str, str] = self.config.get("terminal_shortcuts", {})
+
+        # Strip trailing polite words from norm
+        norm = normalize_for_match(norm)
+
+        # --- A. EXPLICIT TYPING & ENTRY COMMANDS ---
+        m = re.match(r"^(?:type|write|dictate|input)\s+(.+)$", raw.strip(), flags=re.IGNORECASE)
+        if m:
+            payload = re.sub(r"\.$", "", m.group(1).strip())
+            enter = False
+            if re.search(r"\s+(?:and\s+)?(?:press\s+enter|hit\s+enter|enter)$", payload, flags=re.IGNORECASE):
+                payload = re.sub(r"\s+(?:and\s+)?(?:press\s+enter|hit\s+enter|enter)$", "", payload, flags=re.IGNORECASE)
+                enter = True
+            if not dry_check:
+                self.last_typed_text = payload
+                type_text(payload, press_enter=enter)
+                self.alert("Typed Text", f"{payload}{' [Enter]' if enter else ''}")
+            return {"status": "command", "action": "type", "text": payload, "enter": enter}
+
+        m = re.match(r"^(?:type\s+line|enter\s+text|send\s+text|submit\s+text)\s+(.+)$", raw.strip(), flags=re.IGNORECASE)
+        if m:
+            payload = re.sub(r"\.$", "", m.group(1).strip())
+            if not dry_check:
+                self.last_typed_text = payload
+                type_text(payload, press_enter=True)
+                self.alert("Typed Line", f"{payload} [Enter]")
+            return {"status": "command", "action": "type_line", "text": payload}
+
+        # --- B. AGENTIC BROWSER & PERSONAL ASSISTANT ACTIONS ---
+        # 1. "click (on) <link text>" / "open link <link text>" / "follow link <link text>" / "select link <text>"
+        m = re.match(
+            r"^(?:click\s+on\s+the\s+link|click\s+on\s+link|click\s+link|open\s+the\s+link|open\s+link|follow\s+link|click\s+on|select\s+link)\s+(.+)$",
+            norm,
+        )
+        if m:
+            link_target = m.group(1).strip()
+            if not dry_check:
+                browser_click_link_by_text(link_target)
+                self.alert("Browser Assistant", f"Clicked link matching: \"{link_target}\"")
+            return {"status": "command", "action": "browser_click_link", "target": link_target}
+
+        # 2. "find on page <text>" / "search page for <text>" / "find <text> on page"
+        m = re.match(r"^(?:find\s+on\s+page|search\s+page\s+for|search\s+on\s+page\s+for|find\s+in\s+page|highlight)\s+(.+)$", norm)
+        if m:
+            query = m.group(1).strip()
+            if not dry_check:
+                focus_or_launch_browser()
+                press_key("f", ["ctrl"])
+                time.sleep(0.1)
+                type_text(query, press_enter=True)
+                self.alert("Browser Find", f"Highlighted: \"{query}\"")
+            return {"status": "command", "action": "browser_find", "query": query}
+
+        # 3. "next match" / "previous match" (when searching on a page)
+        if norm in ("next match", "find next", "next result"):
+            if not dry_check:
+                press_key("g", ["ctrl"])
+                self.alert("Browser Find", "Next match")
+            return {"status": "command", "action": "find_next"}
+
+        if norm in ("previous match", "find previous", "previous result"):
+            if not dry_check:
+                press_key("g", ["ctrl", "shift"])
+                self.alert("Browser Find", "Previous match")
+            return {"status": "command", "action": "find_prev"}
+
+        # 4. "type in address bar <url/query>" / "navigate to <url/query>" / "take me to <site/topic>"
+        m = re.match(r"^(?:take\s+me\s+to|go\s+to|navigate\s+to|visit|browse\s+to|open\s+website)\s+(?:the\s+)?(.+)$", norm)
+        if m:
+            site = m.group(1).strip()
+            if site in websites:
+                url = websites[site]
+                if not dry_check:
+                    run_bg(["omarchy-launch-browser", url])
+                    self.alert("Opening Website", f"{site.title()} ({url})")
+                return {"status": "command", "action": "open_url", "site": site, "url": url}
+            if site in apps:
+                if not dry_check:
+                    run_bg(apps[site])
+                    self.alert("Launching App", site.title())
+                return {"status": "command", "action": "launch_app", "app": site}
+            # Spoken domain like "github dot com" or "github.com"
+            site_clean = site.replace(" dot ", ".").replace(" slash ", "/")
+            if "." in site_clean and " " not in site_clean:
+                url = site_clean if site_clean.startswith("http") else f"https://{site_clean}"
+                if not dry_check:
+                    run_bg(["omarchy-launch-browser", url])
+                    self.alert("Opening Website", url)
+                return {"status": "command", "action": "open_url", "url": url}
+            # Otherwise treat "take me to <topic>" as an immediate Google "I'm Feeling Lucky" or Search navigation!
+            url = f"https://www.google.com/search?q={quote_plus(site)}"
+            if not dry_check:
+                run_bg(["omarchy-launch-browser", url])
+                self.alert("Browser Assistant", f"Searching for: {site}")
+            return {"status": "command", "action": "web_search", "query": site}
+
+        # 5. "search youtube for <query>" / "search github for <query>" / "search for <query>"
+        m = re.match(r"^search\s+youtube\s+for\s+(.+)$", norm)
+        if m:
+            q = m.group(1).strip()
+            url = f"https://www.youtube.com/results?search_query={quote_plus(q)}"
+            if not dry_check:
+                run_bg(["omarchy-launch-browser", url])
+                self.alert("YouTube Search", f"Searching YouTube: {q}")
+            return {"status": "command", "action": "youtube_search", "query": q}
+
+        m = re.match(r"^search\s+github\s+for\s+(.+)$", norm)
+        if m:
+            q = m.group(1).strip()
+            url = f"https://github.com/search?q={quote_plus(q)}"
+            if not dry_check:
+                run_bg(["omarchy-launch-browser", url])
+                self.alert("GitHub Search", f"Searching GitHub: {q}")
+            return {"status": "command", "action": "github_search", "query": q}
+
+        m = re.match(r"^(?:search\s+for|google|search\s+google\s+for|look\s+up|search\s+the\s+web\s+for)\s+(.+)$", norm)
+        if m:
+            query = m.group(1).strip()
+            url = f"https://www.google.com/search?q={quote_plus(query)}"
+            if not dry_check:
+                run_bg(["omarchy-launch-browser", url])
+                self.alert("Web Search", f"Searching: {query}")
+            return {"status": "command", "action": "web_search", "query": query}
+
+        # 6. Browser back / forward / address bar / tab switching by number
+        if norm in ("go back", "browser back", "back page", "previous page") and not is_terminal_focused():
+            if not dry_check:
+                press_key("Left", ["alt"])
+                self.alert("Browser", "Back (Alt+Left)")
+            return {"status": "command", "action": "browser_back"}
+
+        if norm in ("go forward", "browser forward", "next page", "forward page"):
+            if not dry_check:
+                press_key("Right", ["alt"])
+                self.alert("Browser", "Forward (Alt+Right)")
+            return {"status": "command", "action": "browser_forward"}
+
+        m = re.match(r"^(?:switch\s+to\s+|go\s+to\s+)?tab\s+(\w+)$", norm)
+        if m:
+            num = extract_number(m.group(1))
+            if num is not None and 1 <= num <= 9:
+                if not dry_check:
+                    press_key(str(num), ["ctrl"])
+                    self.alert("Browser Tab", f"Switched to Tab {num}")
+                return {"status": "command", "action": "switch_tab", "tab": num}
+
+        # --- C. APP LAUNCHING ---
+        m = re.match(r"^(?:open|launch|start|run\s+app)\s+(?:the\s+|a\s+|an\s+|up\s+)?(.+)$", norm)
+        if m:
+            target = m.group(1).strip()
+            target = re.sub(r"^(?:the\s+|a\s+|an\s+)", "", target).strip()
+            if target in apps:
+                cmd = apps[target]
+                if not dry_check:
+                    run_bg(cmd)
+                    self.alert("Launching App", f"{target.title()} ({cmd})")
+                return {"status": "command", "action": "launch_app", "app": target, "cmd": cmd}
+            if target in websites:
+                url = websites[target]
+                if not dry_check:
+                    run_bg(["omarchy-launch-browser", url])
+                    self.alert("Opening Website", f"{target.title()} ({url})")
+                return {"status": "command", "action": "open_url", "site": target, "url": url}
+            target_domain = target.replace(" dot ", ".")
+            if re.match(r"^[a-z0-9\-]+\.(?:com|org|net|io|dev|ai|edu)$", target_domain):
+                url = f"https://{target_domain}"
+                if not dry_check:
+                    run_bg(["omarchy-launch-browser", url])
+                    self.alert("Opening Website", url)
+                return {"status": "command", "action": "open_url", "url": url}
+
+        # --- D. SMART TERMINAL COMMANDS ---
+        if norm in term_shortcuts and (not strict_only or is_terminal_focused()):
+            shell_cmd = term_shortcuts[norm]
+            if not dry_check:
+                type_text(shell_cmd, press_enter=True)
+                self.alert("Terminal Command", f"Executed: {shell_cmd}")
+            return {"status": "command", "action": "terminal_cmd", "cmd": shell_cmd}
+
+        m = re.match(r"^(?:run\s+command|run|execute|shell)\s+(.+)$", norm)
+        if m:
+            spoken_cmd = m.group(1).strip()
+            shell_cmd = term_shortcuts.get(spoken_cmd, spoken_cmd)
+            shell_cmd = (
+                shell_cmd.replace(" dash ", " -")
+                .replace(" hyphen ", "-")
+                .replace(" slash ", "/")
+                .replace(" dot ", ".")
+                .replace(" pipe ", " | ")
+            )
+            if not dry_check:
+                type_text(shell_cmd, press_enter=True)
+                self.alert("Terminal Command", f"Executed: {shell_cmd}")
+            return {"status": "command", "action": "terminal_cmd", "cmd": shell_cmd}
+
+        # --- E. WINDOW & WORKSPACE MANAGEMENT (Hyprland) ---
+        if norm in ("close window", "kill window", "quit window", "close application", "close app", "exit window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "killactive"])
+                self.alert("Window Control", "Closed active window")
+            return {"status": "command", "action": "close_window"}
+
+        if norm in ("fullscreen", "full screen", "toggle fullscreen", "maximize", "maximize window", "expand window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "fullscreen", "0"])
+                self.alert("Window Control", "Toggled fullscreen")
+            return {"status": "command", "action": "fullscreen"}
+
+        if norm in ("toggle floating", "float window", "floating window", "tile window"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "togglefloating"])
+                self.alert("Window Control", "Toggled floating window")
+            return {"status": "command", "action": "toggle_floating"}
+
+        if norm in ("next workspace", "workspace next", "switch workspace"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "workspace", "m+1"])
+                self.alert("Workspace", "Switched to next workspace")
+            return {"status": "command", "action": "next_workspace"}
+
+        if norm in ("previous workspace", "workspace previous", "last workspace", "back workspace"):
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "workspace", "m-1"])
+                self.alert("Workspace", "Switched to previous workspace")
+            return {"status": "command", "action": "prev_workspace"}
+
+        m = re.match(r"^(?:(?:go\s+to|switch\s+to|focus|open)\s+)?workspace\s+(\w+)$", norm)
+        if m:
+            num = extract_number(m.group(1))
+            if num is not None:
+                if not dry_check:
+                    run_bg(["hyprctl", "dispatch", "workspace", str(num)])
+                    self.alert("Workspace", f"Switched to Workspace {num}")
+                return {"status": "command", "action": "workspace", "number": num}
+
+        m = re.match(r"^move\s+(?:window\s+)?to\s+workspace\s+(\w+)$", norm)
+        if m:
+            num = extract_number(m.group(1))
+            if num is not None:
+                if not dry_check:
+                    run_bg(["hyprctl", "dispatch", "movetoworkspace", str(num)])
+                    self.alert("Workspace", f"Moved window to Workspace {num}")
+                return {"status": "command", "action": "move_to_workspace", "number": num}
+
+        m = re.match(r"^(?:focus|window|move\s+focus)\s+(left|right|up|down)$", norm)
+        if m:
+            direction = m.group(1)[0]
+            if not dry_check:
+                run_bg(["hyprctl", "dispatch", "movefocus", direction])
+                self.alert("Focus", f"Moved focus {m.group(1)}")
+            return {"status": "command", "action": "movefocus", "direction": m.group(1)}
+
+        # --- F. KEYBOARD & BROWSER SHORTCUTS ---
+        # Notice: "enter", "escape", "tab", "backspace" now work directly as single-word commands too!
+        key_actions: dict[str, tuple[str, list[str] | None, str]] = {
+            "press enter": ("Return", None, "Pressed Enter"),
+            "hit enter": ("Return", None, "Pressed Enter"),
+            "enter": ("Return", None, "Pressed Enter"),
+            "enter key": ("Return", None, "Pressed Enter"),
+            "return": ("Return", None, "Pressed Enter"),
+            "press return": ("Return", None, "Pressed Enter"),
+            "submit": ("Return", None, "Pressed Enter"),
+            "send": ("Return", None, "Pressed Enter"),
+            "send it": ("Return", None, "Pressed Enter"),
+            "send message": ("Return", None, "Pressed Enter"),
+            "execute": ("Return", None, "Pressed Enter"),
+            "go": ("Return", None, "Pressed Enter"),
+            "new line": ("Return", None, "Pressed Enter"),
+            "shift enter": ("Return", ["shift"], "Pressed Shift+Enter (New Line)"),
+            "press escape": ("Escape", None, "Pressed Escape"),
+            "hit escape": ("Escape", None, "Pressed Escape"),
+            "escape": ("Escape", None, "Pressed Escape"),
+            "press tab": ("Tab", None, "Pressed Tab"),
+            "tab": ("Tab", None, "Pressed Tab"),
+            "press space": ("space", None, "Pressed Space"),
+            "press backspace": ("BackSpace", None, "Pressed Backspace"),
+            "backspace": ("BackSpace", None, "Pressed Backspace"),
+            "delete word": ("BackSpace", ["ctrl"], "Deleted previous word"),
+            "scratch that": ("BackSpace", ["ctrl"], "Deleted previous word"),
+            "clear input": ("u", ["ctrl"], "Cleared line (Ctrl+U)"),
+            "select all": ("a", ["ctrl"], "Selected All (Ctrl+A)"),
+            "copy": ("c", ["ctrl"], "Copied (Ctrl+C)"),
+            "copy selection": ("c", ["ctrl"], "Copied (Ctrl+C)"),
+            "paste": ("v", ["ctrl"], "Pasted (Ctrl+V)"),
+            "paste clipboard": ("v", ["ctrl"], "Pasted (Ctrl+V)"),
+            "cut": ("x", ["ctrl"], "Cut (Ctrl+X)"),
+            "undo": ("z", ["ctrl"], "Undo (Ctrl+Z)"),
+            "redo": ("y", ["ctrl"], "Redo (Ctrl+Y)"),
+            "save": ("s", ["ctrl"], "Saved (Ctrl+S)"),
+            "save file": ("s", ["ctrl"], "Saved (Ctrl+S)"),
+            "find on page": ("f", ["ctrl"], "Find (Ctrl+F)"),
+            "new tab": ("t", ["ctrl"], "Opened New Tab (Ctrl+T)"),
+            "close tab": ("w", ["ctrl"], "Closed Tab (Ctrl+W)"),
+            "reopen tab": ("t", ["ctrl", "shift"], "Reopened Tab (Ctrl+Shift+T)"),
+            "next tab": ("Tab", ["ctrl"], "Next Tab"),
+            "previous tab": ("Tab", ["ctrl", "shift"], "Previous Tab"),
+            "refresh page": ("r", ["ctrl"], "Refreshed Page (Ctrl+R)"),
+            "reload page": ("r", ["ctrl"], "Reloaded Page (Ctrl+R)"),
+            "address bar": ("l", ["ctrl"], "Focused Address Bar (Ctrl+L)"),
+            "zoom in": ("equal", ["ctrl"], "Zoomed In"),
+            "zoom out": ("minus", ["ctrl"], "Zoomed Out"),
+            "scroll down": ("Next", None, "Scrolled Down (Page Down)"),
+            "page down": ("Next", None, "Page Down"),
+            "scroll up": ("Prior", None, "Scrolled Up (Page Up)"),
+            "page up": ("Prior", None, "Page Up"),
+            "go to top": ("Home", None, "Scrolled to Top"),
+            "go to bottom": ("End", None, "Scrolled to Bottom"),
+            "press control c": ("c", ["ctrl"], "Sent Ctrl+C"),
+            "control c": ("c", ["ctrl"], "Sent Ctrl+C"),
+            "stop process": ("c", ["ctrl"], "Sent Ctrl+C"),
+            "press control d": ("d", ["ctrl"], "Sent Ctrl+D"),
+            "press control l": ("l", ["ctrl"], "Sent Ctrl+L"),
+            "press control z": ("z", ["ctrl"], "Sent Ctrl+Z"),
+            "see apps": ("Super_L", None, "Opened App Launcher"),
+            "show apps": ("Super_L", None, "Opened App Launcher"),
+            "app launcher": ("Super_L", None, "Opened App Launcher"),
+        }
+
+        if norm in key_actions:
+            key, mods, label = key_actions[norm]
+            if key:
+                if not dry_check:
+                    press_key(key, mods)
+                    self.alert("Keyboard Action", label)
+                return {"status": "command", "action": "key", "key": key, "mods": mods}
+
+        # --- G. SYSTEM & MEDIA CONTROLS ---
+        if norm in ("volume up", "increase volume", "turn volume up", "louder"):
+            if not dry_check:
+                run_bg(["wpctl", "set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "10%+"])
+                self.alert("Audio", "Volume Up (+10%)")
+            return {"status": "command", "action": "volume_up"}
+
+        if norm in ("volume down", "decrease volume", "turn volume down", "quieter", "lower volume"):
+            if not dry_check:
+                run_bg(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "10%-"])
+                self.alert("Audio", "Volume Down (-10%)")
+            return {"status": "command", "action": "volume_down"}
+
+        if norm in ("mute", "mute audio", "unmute", "toggle mute", "mute volume"):
+            if not dry_check:
+                run_bg(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+                self.alert("Audio", "Toggled Mute")
+            return {"status": "command", "action": "toggle_mute"}
+
+        if norm in ("brightness up", "increase brightness", "brighter"):
+            if not dry_check:
+                run_bg(["brightnessctl", "set", "+15%"])
+                self.alert("Display", "Brightness Up (+15%)")
+            return {"status": "command", "action": "brightness_up"}
+
+        if norm in ("brightness down", "decrease brightness", "dimmer", "lower brightness"):
+            if not dry_check:
+                run_bg(["brightnessctl", "set", "15%-"])
+                self.alert("Display", "Brightness Down (-15%)")
+            return {"status": "command", "action": "brightness_down"}
+
+        if norm in ("take screenshot", "screenshot", "capture screen", "screen capture"):
+            if not dry_check:
+                run_bg(["omarchy-capture-screenshot"])
+                self.alert("Capture", "Taking Screenshot")
+            return {"status": "command", "action": "screenshot"}
+
+        if norm in ("lock screen", "lock computer", "system lock"):
+            if not dry_check:
+                run_bg(["omarchy-system-lock"])
+                self.alert("System", "Locking Screen")
+            return {"status": "command", "action": "lock_screen"}
+
+        if norm in ("toggle night light", "night light", "nightlight"):
+            if not dry_check:
+                run_bg(["omarchy", "toggle", "nightlight"])
+                self.alert("Display", "Toggled Night Light")
+            return {"status": "command", "action": "toggle_nightlight"}
+
+        return None
+
+
+class HandsFreeVAD(threading.Thread):
+    """
+    Adaptive Noise-Floor VAD for Samson GoMic:
+    - Continuously tracks a rolling baseline of ambient room noise (`noise_floor`).
+    - Starts recording when RMS exceeds `max(energy_threshold, noise_floor * start_multiplier)`.
+    - Stops recording as soon as RMS stays below `max(energy_threshold * 0.72, noise_floor * stop_multiplier)`
+      for `silence_stop_seconds` (0.85s default), so it NEVER gets stuck waiting for 25 seconds!
+    - Shows a live runtime OSD meter while recording so you get immediate visual feedback.
+    """
+
+    def __init__(self, commander: VoiceCommander, stop_event: threading.Event) -> None:
+        super().__init__(daemon=True)
+        self.commander = commander
+        self.stop_event = stop_event
+        self.cooldown_until: float = 0.0
+
+    def trigger_cooldown(self, seconds: float = 0.9) -> None:
+        self.cooldown_until = time.time() + seconds
+
+    def run(self) -> None:
+        # Cancel any orphan recording left active from a previous session
+        run_bg(["superwhisper", "cancel"], shell=False)
+        while not self.stop_event.is_set():
+            self.commander.load_state()
+            if not self.commander.vad_enabled:
+                time.sleep(0.8)
+                continue
+
+            cfg = load_config()
+            device = cfg.get("general", {}).get(
+                "audio_device", "alsa_input.usb-Samson_Technologies_Samson_GoMic-00.analog-stereo"
+            )
+            live_osd = bool(cfg.get("general", {}).get("live_osd", True))
+            vad_cfg = cfg.get("vad", {})
+            sample_rate = int(vad_cfg.get("sample_rate", 16000))
+            base_threshold = float(vad_cfg.get("energy_threshold", 2200))
+            start_mult = float(vad_cfg.get("start_multiplier", 2.4))
+            stop_mult = float(vad_cfg.get("stop_multiplier", 1.65))
+            start_chunks_req = int(vad_cfg.get("speech_start_chunks", 2))
+            silence_stop_sec = float(vad_cfg.get("silence_stop_seconds", 0.85))
+            max_record_sec = float(vad_cfg.get("max_record_seconds", 14.0))
+            cooldown_sec = float(vad_cfg.get("cooldown_seconds", 0.8))
+
+            # 100ms chunk = 1600 samples = 3200 bytes (s16le mono)
+            chunk_samples = sample_rate // 10
+            chunk_bytes = chunk_samples * 2
+
+            cmd = [
+                "pw-cat",
+                "--record",
+                "--target", device,
+                "--rate", str(sample_rate),
+                "--channels", "1",
+                "--format", "s16",
+                "-",
+            ]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=chunk_bytes,
+                )
+            except Exception as e:
+                print(f"[VAD] Failed to launch pw-cat: {e}", file=sys.stderr)
+                time.sleep(2.0)
+                continue
+
+            # Rolling ambient noise floor window (~3 seconds of quiet chunks)
+            noise_window: collections.deque[float] = collections.deque(maxlen=30)
+            noise_floor = 950.0
+
+            print(
+                f"[VAD] Adaptive VAD listening on {device} (base_threshold={base_threshold:.0f}, silence_stop={silence_stop_sec}s)",
+                flush=True,
+            )
+            active_speech_chunks = 0
+            recording_active = False
+            recording_started_at = 0.0
+            last_voice_at = 0.0
+            last_osd_at = 0.0
+
+            try:
+                while not self.stop_event.is_set():
+                    if not proc.stdout:
+                        break
+                    data = proc.stdout.read(chunk_bytes)
+                    if not data or len(data) < chunk_bytes:
+                        break
+
+                    if int(time.time() * 10) % 15 == 0:
+                        self.commander.load_state()
+                        if not self.commander.vad_enabled:
+                            if recording_active:
+                                run_bg(["superwhisper", "cancel"])
+                                recording_active = False
+                            break
+
+                    now = time.time()
+                    if now < self.cooldown_until:
+                        active_speech_chunks = 0
+                        continue
+
+                    count = len(data) // 2
+                    samples = struct.unpack(f"<{count}h", data)
+                    sum_sq = sum(s * s for s in samples)
+                    rms = math.sqrt(sum_sq / count) if count > 0 else 0.0
+
+                    start_threshold = max(base_threshold, min(noise_floor * start_mult, 4800.0))
+                    stop_threshold = max(base_threshold * 0.72, min(noise_floor * stop_mult, start_threshold * 0.8))
+
+                    if not recording_active:
+                        if rms >= start_threshold:
+                            active_speech_chunks += 1
+                            if active_speech_chunks >= start_chunks_req:
+                                recording_active = True
+                                recording_started_at = now
+                                last_voice_at = now
+                                last_osd_at = now
+                                self.commander.is_recording = True
+                                print(
+                                    f"[VAD] Speech start (RMS={rms:.0f} >= {start_threshold:.0f}, floor={noise_floor:.0f}) -> superwhisper start",
+                                    flush=True,
+                                )
+                                run_bg(["superwhisper", "start", "--device", device], shell=False)
+                                if live_osd:
+                                    notify(
+                                        "Listening (Samson GoMic)...",
+                                        "Speak your command or dictation (pause 0.8s to finish)",
+                                        timeout_ms=1500,
+                                    )
+                        else:
+                            active_speech_chunks = max(0, active_speech_chunks - 1)
+                            # Update ambient noise floor with non-spike samples
+                            if rms < start_threshold * 0.9:
+                                noise_window.append(rms)
+                                if len(noise_window) >= 5:
+                                    sorted_w = sorted(noise_window)
+                                    # Median of quiet chunks is a rock-solid ambient noise floor
+                                    noise_floor = sorted_w[len(sorted_w) // 2]
+                    else:
+                        # Currently recording! Use stop_threshold hysteresis so room noise doesn't hold it open
+                        total_dur = now - recording_started_at
+                        if rms >= stop_threshold:
+                            last_voice_at = now
+
+                        silence_dur = now - last_voice_at
+
+                        # Update live runtime OSD every 0.6s so user sees active listening progress
+                        if live_osd and (now - last_osd_at) >= 0.6:
+                            last_osd_at = now
+                            bars = min(10, max(1, int(rms / 600)))
+                            meter = "█" * bars + "░" * (10 - bars)
+                            notify(
+                                f"Listening... ({total_dur:.1f}s)",
+                                f"Mic: [{meter}] | Pause {max(0.0, silence_stop_sec - silence_dur):.1f}s to send",
+                                timeout_ms=1200,
+                            )
+
+                        if silence_dur >= silence_stop_sec or total_dur >= max_record_sec:
+                            reason = f"Silence ({silence_dur:.2f}s)" if silence_dur >= silence_stop_sec else f"Max duration ({total_dur:.1f}s)"
+                            print(
+                                f"[VAD] {reason} after {total_dur:.1f}s speech (RMS={rms:.0f} < {stop_threshold:.0f}) -> superwhisper stop",
+                                flush=True,
+                            )
+                            recording_active = False
+                            active_speech_chunks = 0
+                            self.commander.is_recording = False
+                            self.cooldown_until = now + cooldown_sec
+                            if live_osd:
+                                notify(
+                                    "Processing Speech...",
+                                    f"Captured {total_dur:.1f}s audio — transcribing...",
+                                    timeout_ms=1500,
+                                )
+                            subprocess.run(
+                                ["superwhisper", "stop"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                            )
+            except Exception as e:
+                print(f"[VAD] Stream error: {e}", file=sys.stderr)
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+
+def watch_recordings(commander: VoiceCommander, vad_thread: HandsFreeVAD | None, stop_event: threading.Event) -> None:
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    seen_folders: set[str] = {
+        p.name for p in RECORDINGS_DIR.iterdir() if p.is_dir() and (p / "meta.json").exists()
+    }
+    print(
+        f"[voice-commander] Watching {RECORDINGS_DIR} (initialized with {len(seen_folders)} existing recordings, mode={commander.mode})",
+        flush=True,
+    )
+    commander.alert(
+        "Voice Commander v2 Ready",
+        f"Mode: {commander.mode.title()} | Fast 0.85s Stop | Adaptive VAD: {'On' if commander.vad_enabled else 'Off'}",
+    )
+
+    while not stop_event.is_set():
+        try:
+            for entry in RECORDINGS_DIR.iterdir():
+                if not entry.is_dir() or entry.name.startswith(".") or entry.name in seen_folders:
+                    continue
+                meta_file = entry / "meta.json"
+                if not meta_file.exists():
+                    continue
+                try:
+                    raw_json = meta_file.read_text(encoding="utf-8")
+                    if not raw_json.strip().endswith("}"):
+                        continue
+                    meta = json.loads(raw_json)
+                except Exception:
+                    continue
+
+                seen_folders.add(entry.name)
+                if vad_thread:
+                    vad_thread.trigger_cooldown(0.8)
+
+                result_text = (meta.get("result") or meta.get("llmResult") or meta.get("rawResult") or "").strip()
+                error = meta.get("linux", {}).get("error")
+                if error:
+                    print(f"[voice-commander] Superwhisper error in {entry.name}: {error}", file=sys.stderr)
+                    commander.alert("Speech Transcription Error", f"{error} (try shorter phrase)")
+                    continue
+                if result_text:
+                    print(f"[voice-commander] Heard ({entry.name}): {result_text!r}", flush=True)
+                    commander.handle_utterance(result_text)
+        except Exception as e:
+            print(f"[voice-commander] Watcher error: {e}", file=sys.stderr)
+
+        time.sleep(0.10)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Voice Commander v2 for Omarchy + Superwhisper")
+    sub = parser.add_subparsers(dest="subcommand")
+
+    p_daemon = sub.add_parser("daemon", help="Run the Voice Commander background daemon")
+    p_daemon.add_argument("--no-vad", action="store_true", help="Disable hands-free VAD thread")
+
+    p_exec = sub.add_parser("exec", help="Simulate or execute a voice phrase directly")
+    p_exec.add_argument("--dry-run", action="store_true", help="Parse and log intent without executing OS side effects")
+    p_exec.add_argument("phrase", nargs="+", help="Voice phrase to process")
+
+    p_mode = sub.add_parser("mode", help="Get or set operating mode (hybrid, command, dictation)")
+    p_mode.add_argument("target", nargs="?", choices=["hybrid", "command", "dictation"])
+
+    p_vad = sub.add_parser("hands-free", help="Enable, disable, or toggle hands-free VAD")
+    p_vad.add_argument("state", choices=["on", "off", "toggle"])
+
+    sub.add_parser("status", help="Show current Voice Commander state")
+
+    args = parser.parse_args()
+    commander = VoiceCommander()
+
+    if args.subcommand == "exec":
+        global DRY_RUN
+        DRY_RUN = bool(getattr(args, "dry_run", False))
+        phrase = " ".join(args.phrase)
+        res = commander.handle_utterance(phrase)
+        print(json.dumps(res, indent=2))
+        return 0
+
+    if args.subcommand == "mode":
+        if args.target:
+            commander.mode = args.target
+            commander.save_state()
+            commander.alert("Voice Mode Changed", f"Active Mode: {commander.mode.title()}")
+        print(json.dumps({"mode": commander.mode, "vad_enabled": commander.vad_enabled}, indent=2))
+        return 0
+
+    if args.subcommand == "hands-free":
+        if args.state == "on":
+            commander.vad_enabled = True
+        elif args.state == "off":
+            commander.vad_enabled = False
+        else:
+            commander.vad_enabled = not commander.vad_enabled
+        commander.save_state()
+        commander.alert(
+            "Hands-Free VAD",
+            f"Continuous listening {'Enabled' if commander.vad_enabled else 'Disabled'}",
+        )
+        print(json.dumps({"mode": commander.mode, "vad_enabled": commander.vad_enabled}, indent=2))
+        return 0
+
+    if args.subcommand == "status":
+        print(
+            json.dumps(
+                {
+                    "mode": commander.mode,
+                    "vad_enabled": commander.vad_enabled,
+                    "config_path": str(CONFIG_PATH),
+                    "recordings_dir": str(RECORDINGS_DIR),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    stop_event = threading.Event()
+
+    def handle_sig(signum: int, _frame: Any) -> None:
+        print(f"[voice-commander] Received signal {signum}, shutting down...", flush=True)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    vad_thread: HandsFreeVAD | None = None
+    if not getattr(args, "no_vad", False):
+        vad_thread = HandsFreeVAD(commander, stop_event)
+        vad_thread.start()
+
+    watch_recordings(commander, vad_thread, stop_event)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

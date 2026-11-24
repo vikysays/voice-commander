@@ -1,0 +1,14 @@
+[Unit]
+Description=Voice Commander Desktop Controller (Superwhisper + Samson GoMic)
+After=graphical-session.target pipewire.service superwhisper.service
+Wants=superwhisper.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/navalblues/.local/bin/voice-commander daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
